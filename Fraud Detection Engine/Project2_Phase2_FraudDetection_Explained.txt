@@ -1,0 +1,476 @@
+================================================================
+💳 PROJECT 2 — FRAUD DETECTION ENGINE
+    Complete Explanation From Start to Finish
+    Built by: Kartik | Munich | 2025
+================================================================
+
+WHAT IS THIS PROJECT?
+---------------------
+We built a Machine Learning model that analyses real credit
+card transactions and detects fraudulent ones automatically.
+This is the most extreme imbalance problem in industry —
+only 0.17% of transactions are fraud!
+
+Dataset  : Kaggle Credit Card Fraud Detection
+Records  : 284,807 real credit card transactions
+Fraud    : Only 492 transactions (0.17%!)
+Features : 30 columns (V1-V28 PCA components + Amount + Time)
+Target   : Class (1=Fraud, 0=Legitimate)
+Result   : 90.82% fraud catch rate (Recall)
+
+KEY DIFFERENCE FROM PHASE 1 PROJECTS:
+    Phase 1 imbalance: 65/35 or 90/10
+    Phase 2 imbalance: 99.83% vs 0.17% ← EXTREME!
+
+    This requires completely different techniques:
+    → scale_pos_weight in XGBoost
+    → class_weight='balanced' in other models
+    → Recall as PRIMARY metric (not accuracy!)
+    → Precision-Recall curve (not ROC curve!)
+
+
+================================================================
+CELL 1 — IMPORTING LIBRARIES
+================================================================
+
+New imports for this project:
+
+average_precision_score
+    → Calculates PR-AUC (area under Precision-Recall curve)
+    → Better than ROC-AUC for extreme imbalance!
+    → Why? ROC-AUC can look good even when model fails
+      on minority class. PR-AUC exposes this!
+
+precision_recall_curve
+    → Calculates precision and recall at every threshold
+    → Used to plot the Precision-Recall curve
+    → Shows tradeoff between catching fraud (recall)
+      and avoiding false alarms (precision)
+
+StratifiedKFold
+    → Cross-validation that preserves class ratios
+    → Critical for imbalanced data!
+    → Without stratify → some folds might have 0 fraud!
+
+
+================================================================
+CELL 2 — LOADING THE DATA
+================================================================
+
+CODE:
+    df = pd.read_csv('creditcard.csv')
+
+RESULTS:
+    Total transactions: 284,807
+    Features: 30
+    Fraud: 492 (0.17%)
+    Legitimate: 284,315 (99.83%)
+
+THE EXTREME IMBALANCE PROBLEM:
+    If our model says "everything is legitimate":
+    Accuracy = 99.83% ← looks amazing!
+    Recall   = 0%     ← catches ZERO fraud!
+
+    This is the ACCURACY PARADOX!
+    A 99.83% accurate model is completely useless!
+
+    This is why we NEVER use accuracy for fraud detection!
+    We use RECALL and PR-AUC instead!
+
+WHY IS THE DATA LIKE THIS?
+    Real fraud is rare — banks catch most attempts
+    Fraudsters are sophisticated and disguise transactions
+    But even 0.17% of millions of transactions = huge losses!
+
+THE FEATURES:
+    V1-V28  → PCA components (anonymised for privacy)
+              Real features like merchant, location etc.
+              transformed to protect cardholder privacy
+    Amount  → Transaction amount in dollars
+    Time    → Seconds elapsed since first transaction
+    Class   → 0=Legitimate, 1=Fraud (TARGET)
+
+
+================================================================
+CELL 3 — FEATURE ENGINEERING
+================================================================
+
+CODE:
+    def engineer_fraud_features(df):
+        df['log_amount']     = np.log1p(df['Amount'])
+        df['is_high_amount'] = (df['Amount'] > 500).astype(int)
+        df['is_low_amount']  = (df['Amount'] < 1).astype(int)
+        df['is_round_amount']= (df['Amount'] % 1 == 0).astype(int)
+        df['hour']           = (df['Time'] % 86400) // 3600
+        df['is_night']       = ((df['hour'] >= 22) |
+                                (df['hour'] <= 6)).astype(int)
+        df['v1_v2']          = df['V1'] * df['V2']
+        df['v3_v4']          = df['V3'] * df['V4']
+        df['v_mean']         = df[v_cols].mean(axis=1)
+        df['v_std']          = df[v_cols].std(axis=1)
+        df['v_range']        = df['v_max'] - df['v_min']
+
+WHAT EACH FEATURE DOES:
+-----------------------
+
+log_amount
+    → np.log1p transforms skewed Amount distribution
+    → Transaction amounts range from $0 to $25,000+
+    → Log makes it more normally distributed
+    → Most ML models prefer normal distributions!
+    → log1p = log(1+x) handles zero values safely
+
+is_high_amount
+    → Binary flag: is Amount > $500?
+    → Fraud often involves large transactions!
+    → Simple but powerful signal
+
+is_low_amount
+    → Binary flag: is Amount < $1?
+    → Fraudsters test stolen cards with tiny amounts first
+    → Then make larger purchases if test succeeds
+    → This is called "card testing" in fraud detection!
+
+is_round_amount
+    → Binary flag: is Amount a round number?
+    → Legitimate purchases: $47.83, $123.45 (specific)
+    → Fraud: $100.00, $500.00 (round, testing the card)
+    → Simple but effective fraud signal!
+
+hour
+    → Extract hour of day from Time column
+    → Time is seconds elapsed → convert to hour
+    → Different fraud patterns at different hours!
+
+is_night
+    → Binary: is it between 10pm and 6am?
+    → Fraud more common at night (cardholder sleeping)
+    → Bank staff reduced at night → slower detection
+
+v1_v2, v3_v4
+    → Interaction features between PCA components
+    → Captures combined effect of multiple PCA dimensions
+    → May reveal fraud patterns hidden in single components
+
+v_mean, v_std, v_range
+    → Statistical summary of ALL V1-V28 components
+    → How spread out are the PCA values?
+    → Unusual statistical profiles signal fraud!
+
+
+================================================================
+CELL 4 — DATA PREPARATION WITH PIPELINE
+================================================================
+
+CODE:
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.2, random_state=42, stratify=y)
+
+    num_transformer = Pipeline(steps=[
+        ('imputer', SimpleImputer(strategy='median')),
+        ('scaler',  StandardScaler())
+    ])
+
+    neg = (y_train == 0).sum()
+    pos = (y_train == 1).sum()
+    spw = neg / pos
+
+THE STRATIFIED SPLIT:
+    stratify=y is CRITICAL for imbalanced data!
+    Without it: test set might have very few fraud cases
+    With it: both sets have same 0.17% fraud ratio
+
+    Train: ~227,846 transactions (~393 fraud)
+    Test:  ~56,961 transactions (~99 fraud)
+
+SCALE_POS_WEIGHT (spw):
+    neg = number of legitimate transactions
+    pos = number of fraud transactions
+    spw = neg/pos = ~578
+
+    This tells XGBoost:
+    "Each fraud case is worth 578 legitimate cases!"
+    "Missing 1 fraud = same as misclassifying 578 legit!"
+
+    This is how XGBoost handles extreme imbalance!
+    It pays 578x more attention to fraud cases!
+
+WHY PIPELINE?
+    Prevents data leakage automatically!
+    Consistent preprocessing for all models!
+    Cross-validation uses correct preprocessing!
+    Production-ready code structure!
+
+
+================================================================
+CELL 5 — TRAINING ALL MODELS
+================================================================
+
+THE 3 IMBALANCE TECHNIQUES USED:
+
+Logistic Regression:
+    class_weight='balanced'
+    → Automatically adjusts sample weights
+    → Fraud samples weighted ~578x more than legit
+    → Model pays more attention to catching fraud
+
+Random Forest:
+    class_weight='balanced'
+    → Same concept as Logistic Regression
+    → Each tree is balanced during bootstrap sampling
+
+XGBoost:
+    scale_pos_weight=spw (=578)
+    → XGBoost's built-in imbalance handler
+    → Mathematically equivalent to class_weight
+    → But XGBoost specific parameter
+
+WHY RECALL IS PRIMARY METRIC:
+    Missing a fraud (False Negative):
+        → Transaction goes through undetected
+        → Customer gets charged for fraud
+        → Bank must reimburse customer
+        → Reputation damage
+        → Cost: HIGH ❌
+
+    False alarm (False Positive):
+        → Legitimate transaction blocked
+        → Customer slightly inconvenienced
+        → Customer calls bank, gets unblocked
+        → Cost: LOW ⚠️
+
+    Therefore: MAXIMISE RECALL!
+    Accept false alarms to catch all fraud!
+
+PR-AUC vs ROC-AUC:
+    ROC-AUC problem:
+        Even a bad model can have high ROC-AUC
+        when data is extremely imbalanced!
+        99.83% legitimate → easy to get high ROC
+
+    PR-AUC is better because:
+        Focuses ONLY on the minority class (fraud)
+        Not influenced by the huge legitimate majority
+        Tells you truly how well you detect fraud!
+
+    Rule: For imbalance > 10:1 → use PR-AUC!
+
+
+================================================================
+CELL 6 — HYPERPARAMETER TUNING
+================================================================
+
+CODE:
+    xgb_search = RandomizedSearchCV(
+        estimator=XGBClassifier(scale_pos_weight=spw,...),
+        param_distributions=xgb_params,
+        n_iter=30,
+        scoring='recall',    ← optimise for catching fraud!
+        cv=StratifiedKFold(n_splits=3)
+    )
+
+KEY DECISION — scoring='recall':
+    We specifically optimise for RECALL not AUC!
+    Why? We want to catch as many fraud cases as possible!
+    GridSearch finds params that maximise recall!
+
+StratifiedKFold:
+    n_splits=3 → 3-fold cross validation
+    shuffle=True → randomly shuffle before splitting
+    random_state=42 → reproducible
+
+    CRITICAL: StratifiedKFold preserves fraud ratio
+    in each fold! Without it → some folds have no fraud!
+
+RESULT:
+    Default XGBoost recall → lower
+    Tuned XGBoost recall   → 90.82% 🏆
+    Catches 9 out of 10 fraudulent transactions!
+
+
+================================================================
+CELL 7 — CONFUSION MATRIX & PRECISION-RECALL CURVE
+================================================================
+
+THE CONFUSION MATRIX FOR FRAUD:
+
+                 Predicted Legit   Predicted Fraud
+Actual Legit  |      TN          |      FP        |
+Actual Fraud  |      FN          |      TP        |
+
+    TP (True Positive):
+        Correctly identified fraud ✅
+        → Customer protected, fraud stopped!
+
+    TN (True Negative):
+        Correctly cleared legitimate transaction ✅
+        → Normal purchase goes through smoothly
+
+    FP (False Positive) — False Alarm:
+        Legitimate transaction flagged as fraud ⚠️
+        → Customer's card declined temporarily
+        → Inconvenient but safe
+
+    FN (False Negative) — WORST CASE! 🚨:
+        Fraud missed, classified as legitimate
+        → Fraudster succeeds, money stolen
+        → Bank must reimburse customer
+        → This is what we MINIMISE!
+
+OUR RESULTS:
+    Fraud caught (TP) : high number ✅
+    Fraud missed (FN) : minimal 🚨
+    Catch rate        : 90.82% 🏆
+
+PRECISION-RECALL CURVE:
+    X-axis = Recall (what % of fraud we catch)
+    Y-axis = Precision (of flagged, what % is real fraud)
+
+    Perfect model → curve in top-right corner
+    Random model  → flat horizontal line at fraud rate
+
+    The curve shows every possible tradeoff:
+    "If I accept more false alarms (lower precision)
+     I can catch more fraud (higher recall)"
+
+    PR-AUC = area under this curve
+    Higher = better fraud detection system!
+
+
+================================================================
+CELL 8 — FEATURE IMPORTANCE
+================================================================
+
+TOP FEATURES (what signals fraud most):
+    Engineered features dominated the top rankings!
+
+log_amount, v_std, v_range, is_night:
+    Our engineered features revealed fraud patterns
+    that raw features couldn't capture alone!
+
+V-component features (V1-V28):
+    These are PCA transformations of real transaction data
+    (merchant category, location, device, etc.)
+    V1, V4, V14, V17 typically most important in fraud
+
+INSIGHT:
+    Fraud has distinctive statistical profiles
+    Our v_mean, v_std, v_range features captured this!
+    A fraudulent transaction "looks" statistically different
+    from legitimate ones across multiple PCA dimensions!
+
+
+================================================================
+KEY CONCEPTS USED IN THIS PROJECT
+================================================================
+
+1. EXTREME CLASS IMBALANCE (0.17%)
+   Most severe imbalance problem in industry
+   99.83% legitimate vs 0.17% fraud
+   Standard accuracy completely meaningless here!
+
+2. scale_pos_weight (XGBoost)
+   = number of negative / number of positive
+   = ~578 for this dataset
+   Tells XGBoost to focus heavily on minority class
+   Built-in XGBoost parameter for imbalance!
+
+3. class_weight='balanced' (sklearn)
+   Automatically calculates weights for each class
+   Works for Logistic Regression and Random Forest
+
+4. RECALL as PRIMARY METRIC
+   Of all actual fraud → how many did we catch?
+   90.82% recall = catch 9 out of 10 fraud cases!
+   This is what banks care about most!
+
+5. PR-AUC (Precision-Recall AUC)
+   Better than ROC-AUC for extreme imbalance
+   Focuses only on minority class performance
+   Use when imbalance > 10:1
+
+6. PRECISION-RECALL TRADEOFF
+   Increasing recall → decreases precision
+   Banks choose their threshold based on:
+   How many false alarms can we handle?
+   How much fraud can we afford to miss?
+
+7. StratifiedKFold
+   Preserves class ratio in each fold
+   Essential for cross-validation with imbalance!
+   Without it → folds might have 0 fraud cases!
+
+8. FEATURE ENGINEERING FOR FRAUD
+   log_amount → normalise skewed amounts
+   is_night   → temporal fraud pattern
+   is_round_amount → card testing behaviour
+   v_stats    → statistical anomaly detection
+
+
+================================================================
+RESULTS SUMMARY
+================================================================
+
+Dataset:
+    284,807 real credit card transactions
+    Only 492 fraud (0.17%!)
+
+Model Performance:
+    Model                  Recall    Precision   PR-AUC
+    -------------------------------------------------------
+    Logistic Regression    high      moderate    good
+    Random Forest          good      good        good
+    XGBoost (default)      good      good        good
+    XGBoost (Tuned)        90.82%    moderate    BEST 🏆
+
+Critical Outcomes:
+    Fraud transactions caught  : ~90% ✅
+    Fraud transactions missed  : ~10% 🚨
+    False alarms               : acceptable ⚠️
+    Catch rate                 : 90.82% 🏆
+
+
+================================================================
+WHY THIS PROJECT IMPRESSES RECRUITERS
+================================================================
+
+1. INDUSTRY-RELEVANT PROBLEM
+   Every bank, fintech, and payment company needs this
+   Visa, Mastercard, PayPal, Stripe all use fraud ML
+   Direct path to high-paying ML engineering roles!
+
+2. EXTREME IMBALANCE MASTERY
+   0.17% is as extreme as it gets in real industry
+   Shows you can handle the hardest data scenarios
+   Most junior engineers can't solve this correctly!
+
+3. CORRECT METRIC SELECTION
+   Using Recall and PR-AUC (not accuracy!)
+   Shows you understand the BUSINESS IMPACT of ML
+   Not just running code but understanding results!
+
+4. scale_pos_weight KNOWLEDGE
+   XGBoost-specific imbalance technique
+   Rarely taught in beginner courses
+   Shows you've gone beyond tutorials!
+
+5. FEATURE ENGINEERING ON FINANCIAL DATA
+   Created domain-specific fraud signals
+   is_night, is_round_amount, log_amount
+   Shows creativity + domain thinking!
+
+6. PIPELINE USAGE
+   Production-ready code structure
+   Companies deploy pipelines, not raw scripts
+   Shows you write professional code!
+
+7. REAL FINANCIAL IMPACT
+   "90.82% recall means catching 9 in 10 fraudulent
+   transactions on 284,807 real credit card records"
+   That's a sentence that ends interviews with job offers!
+
+
+================================================================
+Built by: Kartik | Munich | 2025
+Goal: AGI & Conscious AI | Defending Financial Systems! 💳🚀
+================================================================
